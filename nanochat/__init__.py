@@ -1,1 +1,1 @@
-from .gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig

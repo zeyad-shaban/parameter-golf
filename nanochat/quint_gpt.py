@@ -49,9 +49,14 @@ def act_quant(x):
 
 
 def weight_quant(w):
-    scale = 1.0 / w.abs().mean().clamp_(min=1e-5)
-    return (w * scale).round().clamp_(-1, 1) / scale
-
+    gamma = w.abs().mean().clamp(min=1e-5)
+    w_norm = w / gamma
+    alpha = torch.tensor([-8, -1, 0, 1, 8], device=w.device, dtype=w.dtype)
+    distances = torch.abs(w_norm.unsqueeze(-1) - alpha)
+    indices = distances.argmin(dim=-1)
+    w_quant_norm = alpha[indices]
+    w_quant = w_quant_norm * gamma
+    return w_quant
 
 class BitLinear(nn.Linear):
     """

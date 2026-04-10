@@ -41,6 +41,46 @@ class GPTConfig:
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
+
+# ====
+def act_quant(x):
+    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
+    return (x * scale).round().clamp_(-128, 127) / scale
+
+
+def weight_quant(w):
+    scale = 1.0 / w.abs().mean().clamp_(min=1e-5)
+    return (w * scale).round().clamp_(-1, 1) / scale
+
+
+class BitLinear(nn.Linear):
+    """
+    Implements the BitLinear layer as described in "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
+
+    :param in_features: Number of input features
+    :param out_features: Number of output features
+    :bias: If set to False, the layer will not learn an additive bias. Default: True
+    :device: The device to use. Default: None
+    :dtype: The datatype to use. Default: None
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(in_features, out_features, bias, device, dtype)
+
+    def forward(self, x):
+        x_quant = x + (act_quant(x) - x).detach()
+        w_quant = self.weight + (weight_quant(self.weight) - self.weight).detach()
+        return F.linear(x_quant, w_quant, self.bias)
+# =====
+
+
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
     Replaces autocast: master weights stay fp32 for optimizer precision,
@@ -71,10 +111,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = BitLinear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = BitLinear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = BitLinear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = BitLinear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -128,8 +168,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = BitLinear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = BitLinear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -487,7 +527,7 @@ class GPT(nn.Module):
         rng = None
         if temperature > 0:
             rng = torch.Generator(device=device)
-            rng.manual_seen(seed)
+            rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
         for _ in range(max_tokens):
             logits = self.forward(ids) # (B, T, vocab_size)
